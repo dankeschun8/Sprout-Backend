@@ -1,0 +1,9 @@
+.env
+*.pyc
+__pycache__/
+uploads/
+.venv/
+venv/
+.DS_Store
+weights/
+.pth

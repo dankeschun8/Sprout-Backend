@@ -1,0 +1,2 @@
+*.pth filter=lfs diff=lfs merge=lfs -text
+Backend-Test/weights/internimage.pth filter=lfs diff=lfs merge=lfs -text
