@@ -1,7 +1,6 @@
 import torch.nn as nn
 import timm
 
-
 class InternImageClassifier(nn.Module):
     def __init__(self, num_classes: int, pretrained: bool = True,
                  drop_path_rate: float = 0.1, drop_rate: float = 0.0):
@@ -32,8 +31,11 @@ class InternImageClassifier(nn.Module):
         )
 
     def forward(self, x):
-        features = self.backbone.forward_features(x)
+        features = self.backbone.forward_features(x)  # B, C, H, W
+
         context = self.global_context(features)
         features = features * context
-        x = features.mean(dim=[-2, -1])
+
+        x = features.mean(dim=[-2, -1])  # B, C
+
         return self.head(x)
