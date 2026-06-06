@@ -14,12 +14,9 @@ def model_file_is_invalid(path):
     if not os.path.exists(path):
         return True
 
-    # Real model is around 106 MB.
-    # Git LFS pointer file is usually very small.
     if os.path.getsize(path) < 10 * 1024 * 1024:
         return True
 
-    # Detect Git LFS pointer file
     try:
         with open(path, "rb") as f:
             start = f.read(200)

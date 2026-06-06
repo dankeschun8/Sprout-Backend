@@ -4,12 +4,11 @@ import json
 from torchvision import transforms
 
 from core.model import InternImageClassifier
-# ---------- CONFIG ----------
+
 WEIGHTS_PATH = "weights/internimage.pth"
 CLASS_NAMES_PATH = "class_names.json"
 IMAGE_SIZE = 128
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# ----------------------------
 
 torch.set_grad_enabled(False)
 
@@ -41,6 +40,7 @@ transform = transforms.Compose([
     )
 ])
 
+
 def predict(image_path: str):
     image = Image.open(image_path).convert("RGB")
     tensor = transform(image).unsqueeze(0).to(DEVICE)
@@ -67,7 +67,3 @@ def predict(image_path: str):
         "final": results[0]["class"],
         "predictions": results
     }
-    
-
-if __name__ == "__main__":
-    print(predict("test.jpg"))

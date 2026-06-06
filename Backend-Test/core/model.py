@@ -1,11 +1,11 @@
 import torch.nn as nn
 import timm
 
+
 class InternImageClassifier(nn.Module):
     def __init__(self, num_classes: int, pretrained: bool = True,
                  drop_path_rate: float = 0.1, drop_rate: float = 0.0):
         super().__init__()
-        self.model_name = "InternImage-Tiny"
 
         self.backbone = timm.create_model(
             'convnext_tiny',
@@ -31,11 +31,11 @@ class InternImageClassifier(nn.Module):
         )
 
     def forward(self, x):
-        features = self.backbone.forward_features(x)  # B, C, H, W
+        features = self.backbone.forward_features(x)
 
         context = self.global_context(features)
         features = features * context
 
-        x = features.mean(dim=[-2, -1])  # B, C
+        x = features.mean(dim=[-2, -1])
 
         return self.head(x)
