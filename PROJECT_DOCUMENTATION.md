@@ -1,660 +1,445 @@
 # Sprout Backend Project Documentation
 
-## 1. Project Overview
+## 1. What This Project Is For
 
-Sprout Backend is a Flask-based REST API used by the Sprout frontend to identify herbal plants from images and retrieve related plant and remedy information. The backend receives an uploaded image, preprocesses it, runs a trained image classification model, enriches the prediction with plant details from the Trefle API, and exposes Supabase-powered endpoints for herbal recipe data.
+Sprout Backend is the server-side API for a herbal plant identification and remedy exploration application. Its main job is to connect three important parts of the system:
 
-The main backend code is located inside the `Backend-Test` directory. The application is divided into a main Flask entry point, route modules, and core machine learning modules.
+1. A frontend that sends plant images and requests herb data.
+2. A trained PyTorch image classification model that predicts which herbal plant appears in an uploaded image.
+3. External data services, especially Supabase for remedy records and Trefle for plant metadata and images.
 
-## 2. Project Structure
+In practical terms, the backend lets a user upload a plant image, receives that image through a Flask API, runs machine learning inference, returns the most likely plant class, and enriches the result with scientific, Indonesian, common-name, and image information where available.
+
+The project is designed for an application called Sprout, although the home route still returns the older text `Herbify backend is running`.
+
+## 2. High-Level System Summary
+
+Sprout Backend provides these core capabilities:
+
+| Capability | What It Does |
+|---|---|
+| Image prediction | Accepts an uploaded image and classifies it into one of 113 known herbal plant classes. |
+| Confidence filtering | Returns `Unknown` when the model's top confidence is below `0.7`. |
+| Plant name parsing | Splits class labels into scientific/English names and Indonesian names. |
+| Trefle enrichment | Looks up plant metadata from Trefle, including scientific name, common name, and image URL. |
+| Remedy browsing | Reads herbal recipe/remedy records from Supabase. |
+| Remedy lookup | Retrieves remedies for a specific herb name. |
+| Explore pagination | Returns paginated herb/remedy cards for frontend browse pages. |
+| Railway deployment | Includes root deployment files so Railway can detect, build, and run the app. |
+
+The backend is not a full user-management system. It does not currently store prediction history, authenticate users, or save uploaded images permanently.
+
+## 3. Project Directory Structure
 
 ```text
 Sprout-Backend/
 |-- .gitattributes
 |-- .gitignore
 |-- PROJECT_DOCUMENTATION.md
+|-- README.md
+|-- railway.json
+|-- requirements.txt
+|-- start.sh
 |-- Backend-Test/
+    |-- .env
     |-- app.py
     |-- class_names.json
-    |-- requirements.txt
     |-- FLASK_BACKEND_GUIDE.md
+    |-- requirements.txt
     |-- supabase-flask-guide.md
     |-- core/
     |   |-- __init__.py
     |   |-- inference.py
     |   |-- model.py
+    |   |-- plant_info.py
     |-- routes/
-        |-- __init__.py
-        |-- predict.py
-        |-- explore.py
+    |   |-- __init__.py
+    |   |-- explore.py
+    |   |-- predict.py
+    |-- uploads/
+    |-- weights/
+    |-- venv/
 ```
 
-## 3. Main Application File
+Some folders are local-only and ignored by Git:
 
-### `Backend-Test/app.py`
+| Path | Purpose | Git Status |
+|---|---|---|
+| `Backend-Test/.env` | Local API keys and service URLs. | Ignored |
+| `Backend-Test/uploads/` | Temporary uploaded image storage. | Ignored |
+| `Backend-Test/weights/` | Local PyTorch model weights. | Ignored |
+| `Backend-Test/venv/` | Local Python virtual environment. | Ignored |
+| `__pycache__/` | Python bytecode cache. | Ignored |
 
-This file is the main entry point of the Flask backend. It creates the Flask application, enables CORS, checks whether the model weights exist, downloads the model if needed, registers route blueprints, and starts the server.
+## 4. Current Source Files
 
-The file begins by loading environment variables with `load_dotenv()`. These environment variables are used by other modules for API keys and service URLs, such as Trefle and Supabase credentials.
+### 4.1 `Backend-Test/app.py`
 
-```python
-load_dotenv()
-```
+This is the Flask application entry point. It performs the startup sequence for the backend:
 
-The application defines the model weight path:
+1. Loads environment variables with `load_dotenv()`.
+2. Checks whether the model weights file exists and looks valid.
+3. Downloads the model weights from Google Drive if the local weights file is missing or invalid.
+4. Imports and registers route blueprints.
+5. Creates the Flask app.
+6. Enables CORS.
+7. Exposes the home health-check route.
+8. Runs Flask in debug mode when started directly.
+
+Important constants:
 
 ```python
 MODEL_PATH = "weights/internimage.pth"
 MODEL_URL = "https://drive.google.com/uc?id=1zcQ6sa-mVxv6y5OWqTtHT5Mn0dyiGrEp"
 ```
 
-The function `model_file_is_invalid(path)` checks whether the model file is missing, too small, or only a Git LFS pointer file. This is important because large `.pth` files are often stored using Git LFS. If the actual model file is not present, the application downloads it from Google Drive using `gdown`.
+The path is relative to the working directory. This is why local execution and Railway deployment should start from inside `Backend-Test`.
+
+The model validation function checks three conditions:
+
+| Check | Why It Exists |
+|---|---|
+| File does not exist | The app cannot run inference without weights. |
+| File is smaller than 10 MB | Real model weights are much larger; tiny files are probably placeholders. |
+| File begins like a Git LFS pointer | Git LFS pointer files are metadata, not usable model weights. |
+
+The app imports route blueprints only after the model file check. That order matters because importing the prediction route imports `core.inference`, and `core.inference` immediately loads the model weights.
+
+### 4.2 `Backend-Test/routes/predict.py`
+
+This file defines the image prediction route.
+
+Main objects:
 
 ```python
-if model_file_is_invalid(MODEL_PATH):
-    os.makedirs("weights", exist_ok=True)
-    gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
-```
-
-After the model file check, the route blueprints are imported and registered:
-
-```python
-from routes.predict import predict_bp
-from routes.explore import explore_bp
-
-app.register_blueprint(predict_bp)
-app.register_blueprint(explore_bp)
-```
-
-The home route is a simple health-check endpoint:
-
-```python
-@app.route("/")
-def home():
-    return {"message": "Herbify backend is running"}
-```
-
-When run directly, Flask starts in debug mode:
-
-```python
-if __name__ == "__main__":
-    app.run(debug=True)
-```
-
-## 4. Prediction Route
-
-### `Backend-Test/routes/predict.py`
-
-This file defines the `/predict` endpoint. It handles image upload, file validation, temporary storage, model prediction, plant name extraction, Trefle API lookup, and final JSON response.
-
-The route is organized as a Flask blueprint:
-
-```python
-predict_bp = Blueprint('predict', __name__)
-```
-
-The uploaded image is temporarily saved inside the `uploads` folder:
-
-```python
+predict_bp = Blueprint("predict", __name__)
 UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 ```
 
-### `extract_plant_name(class_label)`
-
-This helper function extracts the scientific or main plant name from a class label. The class labels are stored in the format:
+The route accepts image uploads at:
 
 ```text
-Aloe Vera (Lidah Buaya)
+POST /predict
 ```
 
-For this example, `extract_plant_name()` returns:
+The uploaded file must be sent as multipart form data with the field name:
 
 ```text
-Aloe Vera
+image
 ```
 
-It does this by reading the text before the opening parenthesis.
+The route flow is:
 
-### `get_indonesian_name(class_label)`
+1. Check that `image` exists in `request.files`.
+2. Reject empty filenames.
+3. Sanitize the filename with `secure_filename()`.
+4. Save the uploaded file temporarily in `uploads/`.
+5. Call `predict(image_path)` from `core.inference`.
+6. If the model result is known, extract the main plant name and Indonesian plant name.
+7. Fetch plant details from Trefle through `core.plant_info.get_plant_info()`.
+8. Return the final JSON response.
+9. Delete the temporary uploaded image in the `finally` block.
 
-This helper function extracts the Indonesian plant name from the text inside parentheses. For example:
+The route has two helper functions:
 
-```text
-Aloe Vera (Lidah Buaya)
-```
+| Function | Input Example | Output Example |
+|---|---|---|
+| `extract_plant_name()` | `Aloe Vera (Lidah Buaya)` | `Aloe Vera` |
+| `get_indonesian_name()` | `Aloe Vera (Lidah Buaya)` | `Lidah Buaya` |
 
-returns:
+These helpers rely on the class-label format stored in `class_names.json`.
 
-```text
-Lidah Buaya
-```
+### 4.3 `Backend-Test/routes/explore.py`
 
-The Indonesian name is important because the frontend uses it to request matching remedy data from the Supabase-backed route.
-
-### `get_plant_info(plant_name)`
-
-This function connects to the Trefle API. It receives a plant name, formats it for search by replacing spaces with hyphens, and sends a GET request using the configured Trefle token and API URL.
+This file defines endpoints for remedy and explore data. It connects to Supabase using:
 
 ```python
-params = {
-    "token": [os.getenv('TREFLE_TOKEN')],
-    "q": query_name
-}
-response = requests.get(os.getenv('TREFLE_API_URL'), params=params, timeout=10)
-```
-
-If Trefle returns plant data, the backend keeps the scientific name, common name, and image URL:
-
-```python
-return {
-    "scientific_name": plant.get("scientific_name"),
-    "common_name": plant.get("common_name"),
-    "image_url": plant.get("image_url"),
-}
-```
-
-If the API request fails or no plant is found, the function returns `None`.
-
-### `/predict`
-
-The `/predict` endpoint accepts only POST requests:
-
-```python
-@predict_bp.route("/predict", methods=["POST"])
-def predict_route():
-```
-
-The frontend sends the image using the form key `image`. The route first checks whether the image exists:
-
-```python
-if "image" not in request.files:
-    return jsonify({"error": "No image uploaded"}), 400
-```
-
-It also checks whether the filename is empty:
-
-```python
-if file.filename == "":
-    return jsonify({"error": "Empty filename"}), 400
-```
-
-The filename is sanitized with `secure_filename()` to prevent unsafe file paths:
-
-```python
-filename = secure_filename(file.filename)
-```
-
-The image is then saved temporarily:
-
-```python
-image_path = os.path.join(UPLOAD_FOLDER, filename)
-file.save(image_path)
-```
-
-After saving the image, the backend calls the `predict()` function from `core/inference.py`:
-
-```python
-result = predict(image_path)
-```
-
-If the model returns a known class, the route extracts the scientific name and Indonesian name, adds them to the response, and fetches plant details from Trefle.
-
-Finally, the endpoint returns the result as JSON. The uploaded file is deleted in the `finally` block to avoid storing unnecessary user images on the server:
-
-```python
-finally:
-    if os.path.exists(image_path):
-        os.remove(image_path)
-```
-
-## 5. Explore and Remedy Routes
-
-### `Backend-Test/routes/explore.py`
-
-This file defines routes that retrieve herbal remedy data from Supabase and plant image information from Trefle.
-
-The file creates a Supabase client using environment variables:
-
-```python
-supabase = supabase_client.create_client(
+supabase_client.create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
 )
 ```
 
-It also contains a `get_plant_info(plant_name)` function similar to the one in `predict.py`. This function is used by the explore endpoint to enrich Supabase recipe data with plant images from Trefle.
+The route module expects two Supabase tables:
 
-### `/api/remedies`
+| Table | Expected Purpose |
+|---|---|
+| `herbs` | Stores herb IDs, herb names, and scientific names. |
+| `herbal_recipes` | Stores remedy instructions, uses, dosage, warnings, and relationships to herbs. |
 
-This GET endpoint returns all herbal recipe records from the `herbal_recipes` table and joins herb names from the related `herbs` table.
+The module defines two Supabase select strings:
 
-```python
-@explore_bp.route('/api/remedies', methods=['GET'])
-def get_remedies():
-```
+| Constant | Purpose |
+|---|---|
+| `REMEDY_SELECT` | Selects remedy fields and joined herb name. |
+| `EXPLORE_SELECT` | Selects recipe fields plus joined herb ID, herb name, and scientific name. |
 
-The Supabase query selects fields such as:
+The helper `format_remedy(item)` flattens Supabase's nested join response into a simpler JSON shape.
 
-- `instructions`
-- `used_for`
-- `dosage`
-- `side_effects`
-- `contraindications`
-- `warnings`
-- `interactions`
-- `part_used`
-- `herbs(herb_name)`
+### 4.4 `Backend-Test/core/inference.py`
 
-The response is flattened before being returned to the frontend. This means nested Supabase data is converted into a simpler JSON structure.
+This file loads the trained model and exposes the `predict(image_path)` function used by the `/predict` route.
 
-### `/api/remedies/by/<herb_name>`
-
-This GET endpoint returns remedy data for a specific herb name:
-
-```python
-@explore_bp.route('/api/remedies/by/<herb_name>', methods=['GET'])
-def get_remedies_by_herb(herb_name):
-```
-
-The function first searches the `herbs` table for matching rows:
-
-```python
-herb_res = supabase.table('herbs') \
-    .select('herb_id, herb_name') \
-    .eq('herb_name', herb_name) \
-    .execute()
-```
-
-If no herb is found, it returns an empty list. If a herb is found, it collects the `herb_id` values and uses them to query the `herbal_recipes` table:
-
-```python
-res = supabase.table('herbal_recipes').select(...).in_('herb_id', herb_ids).execute()
-```
-
-This route is used after prediction. The frontend receives the predicted Indonesian herb name, then calls this endpoint to retrieve related remedy data.
-
-### `/api/explore`
-
-This GET endpoint supports paginated browsing of herbal plants and remedies:
-
-```python
-@explore_bp.route('/api/explore', methods=['GET'])
-def get_explore():
-```
-
-It accepts optional query parameters:
-
-- `page`
-- `per_page`
-
-The route calculates the Supabase range from the requested page:
-
-```python
-start = (page - 1) * per_page
-end = page * per_page - 1
-```
-
-It then queries `herbal_recipes`, joins related herb information, retrieves total count, and returns:
-
-- `herbs`
-- `total_pages`
-- `total`
-- `page`
-
-For each herb, the route also attempts to fetch plant image data from the Trefle API.
-
-## 6. Machine Learning Inference
-
-### `Backend-Test/core/inference.py`
-
-This file loads the trained model and defines the image prediction process.
-
-The main configuration values are:
+Important constants:
 
 ```python
 WEIGHTS_PATH = "weights/internimage.pth"
 CLASS_NAMES_PATH = "class_names.json"
-IMAGE_SIZE = 224
+IMAGE_SIZE = 128
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 ```
 
-`WEIGHTS_PATH` points to the trained PyTorch model checkpoint. `CLASS_NAMES_PATH` points to the list of class labels. `IMAGE_SIZE` defines the size used for inference preprocessing. `DEVICE` automatically uses CUDA if a compatible GPU is available, otherwise it uses CPU.
+The file does model setup at import time:
 
-Gradient calculation is disabled because inference does not need training updates:
+1. Disables gradient calculation globally with `torch.set_grad_enabled(False)`.
+2. Loads class labels from `class_names.json`.
+3. Creates an `InternImageClassifier` with the correct number of output classes.
+4. Moves the model to GPU if CUDA is available, otherwise CPU.
+5. Loads the checkpoint from `weights/internimage.pth`.
+6. Loads `checkpoint["model_state_dict"]` into the model.
+7. Sets the model to evaluation mode.
+8. Defines the image preprocessing transform.
 
-```python
-torch.set_grad_enabled(False)
-```
-
-The file loads the class names from `class_names.json`:
-
-```python
-with open(CLASS_NAMES_PATH, "r") as f:
-    class_names = json.load(f)
-```
-
-The number of classes is calculated from the class list:
+The preprocessing pipeline:
 
 ```python
-num_classes = len(class_names)
-```
-
-The model is created using `InternImageClassifier`:
-
-```python
-model = InternImageClassifier(
-    num_classes=num_classes,
-    pretrained=False
+transforms.Resize((128, 128))
+transforms.ToTensor()
+transforms.Normalize(
+    mean=[0.485, 0.456, 0.406],
+    std=[0.229, 0.224, 0.225]
 )
 ```
 
-The checkpoint is loaded from disk:
+The `predict()` function:
+
+1. Opens the uploaded image with PIL.
+2. Converts it to RGB.
+3. Applies the transform.
+4. Adds a batch dimension.
+5. Moves the tensor to the selected device.
+6. Runs the model inside `torch.inference_mode()`.
+7. Applies softmax to produce probabilities.
+8. Extracts the top three predictions.
+9. Returns `Unknown` when the top confidence is below `0.7`.
+
+### 4.5 `Backend-Test/core/model.py`
+
+This file defines the neural network class:
 
 ```python
-checkpoint = torch.load(
-    WEIGHTS_PATH,
-    map_location=DEVICE,
-    weights_only=True
-)
-model.load_state_dict(checkpoint["model_state_dict"])
-model.eval()
+class InternImageClassifier(nn.Module)
 ```
 
-The model is placed in evaluation mode with `model.eval()`. This disables training behavior such as dropout randomness and makes predictions more stable.
-
-### Image Preprocessing
-
-The preprocessing pipeline uses `torchvision.transforms`:
+Although the class is named `InternImageClassifier`, the current implementation uses a ConvNeXt Tiny backbone from the `timm` library:
 
 ```python
-transform = transforms.Compose([
-    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
-    )
-])
-```
-
-The uploaded image is:
-
-1. Resized to `224 x 224`.
-2. Converted into a PyTorch tensor.
-3. Normalized using ImageNet mean and standard deviation.
-
-### `predict(image_path)`
-
-The `predict()` function receives the path of the uploaded image.
-
-```python
-def predict(image_path: str):
-```
-
-It opens the image with PIL and converts it to RGB:
-
-```python
-image = Image.open(image_path).convert("RGB")
-```
-
-The image is transformed, given a batch dimension, and moved to the selected device:
-
-```python
-tensor = transform(image).unsqueeze(0).to(DEVICE)
-```
-
-The model produces output logits:
-
-```python
-outputs = model(tensor)
-```
-
-The logits are converted into probabilities using softmax:
-
-```python
-probs = torch.softmax(outputs, dim=1)
-```
-
-The top three predictions are selected:
-
-```python
-topk_conf, topk_idx = torch.topk(probs, k=3)
-```
-
-The function returns each predicted class and its confidence score. If the highest confidence score is below `0.7`, the final result is set to `Unknown`:
-
-```python
-if results[0]["confidence"] < 0.7:
-    return {
-        "predictions": results,
-        "final": "Unknown"
-    }
-```
-
-Otherwise, the final result is the class with the highest confidence.
-
-## 7. Model Architecture
-
-### `Backend-Test/core/model.py`
-
-This file defines the model class used for plant classification.
-
-```python
-class InternImageClassifier(nn.Module):
-```
-
-Although the class is named `InternImageClassifier`, the current implementation uses a `convnext_tiny` backbone from the `timm` library:
-
-```python
-self.backbone = timm.create_model(
-    'convnext_tiny',
+timm.create_model(
+    "convnext_tiny",
     pretrained=pretrained,
     num_classes=0,
     drop_path_rate=drop_path_rate,
 )
 ```
 
-The `num_classes=0` setting removes the default classification head, allowing the project to define its own custom classification layers.
+The model consists of three conceptual parts:
 
-The model stores the number of output features from the backbone:
+| Part | Purpose |
+|---|---|
+| ConvNeXt Tiny backbone | Extracts visual features from the image. |
+| Global context block | Learns channel-wise weighting for extracted features. |
+| Classification head | Converts pooled features into class logits. |
 
-```python
-self.feature_dim = self.backbone.num_features
+The global context block uses adaptive average pooling, two 1x1 convolutions, GELU activation, and sigmoid activation. It creates a feature weighting mask and multiplies that mask with the backbone feature map.
+
+The classification head uses:
+
+1. `LayerNorm`
+2. `Dropout`
+3. `Linear`
+
+The forward pass is:
+
+```text
+input image tensor
+-> ConvNeXt feature extraction
+-> global context weighting
+-> spatial mean pooling
+-> classification head
+-> logits for 113 plant classes
 ```
 
-### Global Context Block
+### 4.6 `Backend-Test/core/plant_info.py`
 
-The model includes a global context module:
+This file centralizes Trefle API access so prediction and explore routes do not duplicate the same lookup logic.
 
-```python
-self.global_context = nn.Sequential(
-    nn.AdaptiveAvgPool2d(1),
-    nn.Conv2d(self.feature_dim, self.feature_dim // 4, 1),
-    nn.GELU(),
-    nn.Conv2d(self.feature_dim // 4, self.feature_dim, 1),
-    nn.Sigmoid()
-)
-```
-
-This block learns channel-wise attention weights. It helps the model emphasize useful feature channels and reduce less useful ones.
-
-### Classification Head
-
-The classification head contains:
-
-- `LayerNorm`
-- `Dropout`
-- `Linear`
+The function:
 
 ```python
-self.head = nn.Sequential(
-    nn.LayerNorm(self.feature_dim),
-    nn.Dropout(max(drop_rate, 0.1)),
-    nn.Linear(self.feature_dim, num_classes)
-)
+get_plant_info(plant_name)
 ```
 
-The final linear layer outputs one score for each plant class.
+does this:
 
-### Forward Pass
+1. Replaces spaces in the plant name with hyphens.
+2. Sends a GET request to `TREFLE_API_URL`.
+3. Includes `TREFLE_TOKEN` as a query parameter.
+4. Reads the first item from the returned `data` array.
+5. Returns only the fields the frontend needs.
 
-The `forward()` method defines how input images move through the model:
+Returned object:
 
-```python
-features = self.backbone.forward_features(x)
-context = self.global_context(features)
-features = features * context
-x = features.mean(dim=[-2, -1])
-return self.head(x)
+```json
+{
+  "scientific_name": "Aloe vera",
+  "common_name": "Aloe",
+  "image_url": "https://example.com/image.jpg"
+}
 ```
 
-The image first passes through the ConvNeXt backbone. The extracted feature map is multiplied by the global context weights, pooled into a vector, and passed through the classification head.
+If Trefle fails, returns no data, or raises an exception, the function returns `None`.
 
-## 8. Class Names
+### 4.7 `Backend-Test/class_names.json`
 
-### `Backend-Test/class_names.json`
+This file contains the class labels used by the model. The project currently has 113 classes.
 
-This JSON file contains the plant class labels used by the model. The project currently has 113 classes. Each label follows this general format:
+Each model output index maps directly to a class label in this file. The order must stay synchronized with the model training output order.
+
+Example labels:
+
+```text
+Abelmoschus Esculentus (Okra)
+Acorus Calamus (Dlingo)
+Aloe Vera (Lidah Buaya)
+Alstonia Scholaris (Pulai)
+Amaranthus Spinosus (Bayam Duri)
+```
+
+The label convention is:
 
 ```text
 Scientific or English Name (Indonesian Name)
 ```
 
-Example:
+The prediction route depends on this convention to extract Indonesian names for remedy lookups.
+
+### 4.8 `Backend-Test/requirements.txt`
+
+This file contains Python dependencies needed by the backend.
+
+| Package | Purpose |
+|---|---|
+| `flask` | Web API framework. |
+| `flask-cors` | Allows cross-origin frontend requests. |
+| `python-dotenv` | Loads local environment variables from `.env`. |
+| `requests` | Calls the Trefle API. |
+| `supabase` | Connects to Supabase tables. |
+| `gdown` | Downloads model weights from Google Drive. |
+| `torch` | Runs the PyTorch model. |
+| `torchvision` | Provides image transforms. |
+| `timm` | Provides the ConvNeXt Tiny model backbone. |
+| `pillow` | Opens and converts uploaded images. |
+| `gunicorn` | Production WSGI server used by Railway. |
+
+### 4.9 Root `requirements.txt`
+
+Railway analyzes the repository root. Because the real app is inside `Backend-Test`, the root `requirements.txt` delegates dependency installation to the nested file:
 
 ```text
-Aloe Vera (Lidah Buaya)
+-r Backend-Test/requirements.txt
 ```
 
-The order of class names is important because the model output index is mapped directly to this list. For example, if the model predicts index `2`, the backend uses the class at position `2` in `class_names.json`.
+Without this file, Railway may fail to detect the project as a Python app.
 
-## 9. Package Files
+### 4.10 `start.sh`
 
-### `Backend-Test/requirements.txt`
+This is the production start script used by Railway:
 
-This file lists the Python dependencies required to run the backend:
+```bash
+cd Backend-Test
+gunicorn app:app --bind "0.0.0.0:${PORT:-5000}"
+```
+
+It moves into `Backend-Test` first so relative paths like `weights/internimage.pth` and `class_names.json` resolve correctly.
+
+### 4.11 `railway.json`
+
+This file tells Railway exactly how to start the app:
+
+```json
+{
+  "deploy": {
+    "startCommand": "bash start.sh",
+    "restartPolicyType": "on_failure",
+    "restartPolicyMaxRetries": 10
+  }
+}
+```
+
+It removes ambiguity from Railpack's build/start detection.
+
+## 5. Environment Variables
+
+The backend expects these variables:
+
+| Variable | Required | Used By | Purpose |
+|---|---:|---|---|
+| `TREFLE_TOKEN` | Yes | `core/plant_info.py` | API token for Trefle plant search. |
+| `TREFLE_API_URL` | Yes | `core/plant_info.py` | Trefle plant search endpoint. |
+| `SUPABASE_URL` | Yes | `routes/explore.py` | Supabase project URL. |
+| `SUPABASE_KEY` | Yes | `routes/explore.py` | Supabase anon/service key used by the Python client. |
+| `PORT` | Railway provides this | `start.sh` | Port used by Gunicorn in production. |
+
+Local `.env` example:
 
 ```text
-flask
-flask-cors
-python-dotenv
-requests
-supabase
-gdown
-torch
-torchvision
-timm
-pillow
-gunicorn
+TREFLE_TOKEN=your_trefle_token
+TREFLE_API_URL=https://trefle.io/api/v1/plants/search
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your_supabase_key
 ```
 
-Important packages include:
+The `.env` file is ignored by Git and should not be committed.
 
-- `flask`: Creates the REST API.
-- `flask-cors`: Allows the frontend to call the backend from a different origin.
-- `python-dotenv`: Loads environment variables from `.env`.
-- `requests`: Calls the Trefle API.
-- `supabase`: Connects to Supabase.
-- `gdown`: Downloads model weights from Google Drive.
-- `torch`: Runs the PyTorch model.
-- `torchvision`: Provides image transforms.
-- `timm`: Provides the ConvNeXt model backbone.
-- `pillow`: Opens and converts uploaded images.
-- `gunicorn`: Runs the app in production environments.
+## 6. API Reference
 
-## 10. Empty Package Initializers
+### 6.1 `GET /`
 
-### `Backend-Test/core/__init__.py`
+Health-check route.
 
-This file is empty. Its purpose is to mark the `core` directory as a Python package so that modules such as `core.inference` and `core.model` can be imported.
+Response:
 
-### `Backend-Test/routes/__init__.py`
+```json
+{
+  "message": "Herbify backend is running"
+}
+```
 
-This file is empty. Its purpose is to mark the `routes` directory as a Python package so that route modules can be imported into the Flask app.
+Use this endpoint to confirm the app is reachable.
 
-## 11. Repository Configuration Files
+### 6.2 `POST /predict`
 
-### `.gitignore`
+Uploads a plant image and returns prediction results.
 
-The `.gitignore` file prevents sensitive, generated, or large local files from being committed. It ignores:
-
-- `.env`
-- Python cache files
-- `uploads/`
-- virtual environments
-- system files
-- model weight files
-
-This is important because `.env` may contain API keys, and model weight files are usually too large for normal Git storage.
-
-### `.gitattributes`
-
-This file configures Git LFS behavior for `.pth` files:
+Request type:
 
 ```text
-*.pth filter=lfs diff=lfs merge=lfs -text
-Backend-Test/weights/internimage.pth filter=lfs diff=lfs merge=lfs -text
+multipart/form-data
 ```
 
-It tells Git to treat PyTorch model files as large binary files managed by Git LFS.
+Required field:
 
-## 12. Existing Guide Files
-
-### `Backend-Test/FLASK_BACKEND_GUIDE.md`
-
-This file is a general guide explaining Flask backend concepts, image upload, prediction endpoints, Trefle usage, and possible future backend features. Some examples in the guide describe an expanded or older version of the backend, so the current source code should be treated as the authoritative implementation.
-
-### `Backend-Test/supabase-flask-guide.md`
-
-This file is a guide for connecting Flask to Supabase. It includes examples using PostgreSQL drivers and common database query patterns. The current project code uses the `supabase` Python client rather than raw `psycopg2` queries.
-
-## 13. Environment Variables
-
-The backend expects the following environment variables to be available:
-
-```text
-TREFLE_TOKEN
-TREFLE_API_URL
-SUPABASE_URL
-SUPABASE_KEY
-```
-
-These values should be placed in a local `.env` file inside the backend runtime directory. The `.env` file is ignored by Git for security.
-
-## 14. API Endpoints Summary
-
-| Method | Endpoint | Purpose |
+| Field | Type | Description |
 |---|---|---|
-| GET | `/` | Health check route showing that the backend is running. |
-| POST | `/predict` | Receives an image, runs model prediction, and returns plant details. |
-| GET | `/api/remedies` | Returns all herbal recipe data from Supabase. |
-| GET | `/api/remedies/by/<herb_name>` | Returns recipe data for a specific herb name. |
-| GET | `/api/explore?page=1&per_page=6` | Returns paginated herb and remedy data for the Explore page. |
+| `image` | File | Image to classify. |
 
-## 15. Complete Prediction Flow
+Example cURL:
 
-The prediction flow connects the frontend, Flask backend, model, Trefle API, and Supabase data.
-
-```text
-User uploads or captures an image in the frontend
--> Frontend sends the image to Flask /predict as FormData
--> Flask validates the uploaded file
--> Flask temporarily saves the file in uploads/
--> Backend preprocesses the image using PIL and torchvision transforms
--> PyTorch model predicts the top plant classes
--> Backend checks confidence threshold
--> Backend extracts scientific name and Indonesian name
--> Backend fetches plant details and image URL from Trefle
--> Backend returns prediction JSON to frontend
--> Frontend uses Indonesian name to call /api/remedies/by/<herb_name>
--> Flask retrieves recipe data from Supabase
--> Frontend displays plant name, confidence, image, and herbal uses
+```bash
+curl -X POST http://127.0.0.1:5000/predict -F "image=@test.jpg"
 ```
 
-## 16. Response Data Example
-
-A successful `/predict` response has this general structure:
+Successful known-plant response:
 
 ```json
 {
@@ -683,88 +468,482 @@ A successful `/predict` response has this general structure:
 }
 ```
 
-If the confidence is below the threshold, the response uses:
+Low-confidence response:
 
 ```json
 {
-  "final": "Unknown",
-  "predictions": []
+  "predictions": [
+    {
+      "class": "Some Class",
+      "confidence": 0.4123
+    },
+    {
+      "class": "Another Class",
+      "confidence": 0.2531
+    },
+    {
+      "class": "Third Class",
+      "confidence": 0.1107
+    }
+  ],
+  "final": "Unknown"
 }
 ```
 
-The actual low-confidence response still includes the top three predictions, but the `final` field is set to `Unknown`.
+Error responses:
 
-## 17. Important Implementation Notes
+| Status | Body | Meaning |
+|---:|---|---|
+| `400` | `{"error": "No image uploaded"}` | No `image` field was included. |
+| `400` | `{"error": "Empty filename"}` | Uploaded file has no filename. |
+| `500` | `{"error": "..."}` | Prediction, model, filesystem, or API error. |
 
-The current inference image size is set to `224 x 224` in `core/inference.py`. If the model was trained using a different image size, such as `128 x 128`, the inference size should usually match the training size to keep preprocessing consistent.
+### 6.3 `GET /api/remedies`
 
-The class is named `InternImageClassifier`, but the current implementation uses the `convnext_tiny` backbone from `timm`. If the thesis or report describes the model architecture, it should mention the actual implementation or rename the class to avoid confusion.
+Returns all remedy records from Supabase, flattened for frontend use.
 
-The `/predict` route only retrieves Trefle plant details. Supabase remedy data is retrieved through separate endpoints, especially `/api/remedies/by/<herb_name>`, which the frontend calls after receiving the prediction result.
-
-Uploaded images are deleted after prediction. This improves privacy and prevents storage growth, but it also means the backend does not keep user-uploaded images for history or auditing.
-
-## 18. Running the Backend
-
-Install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-Create a `.env` file with the required credentials:
-
-```text
-TREFLE_TOKEN=your_trefle_token
-TREFLE_API_URL=https://trefle.io/api/v1/plants/search
-SUPABASE_URL=your_supabase_url
-SUPABASE_KEY=your_supabase_key
-```
-
-Run the backend from the `Backend-Test` directory:
-
-```bash
-python app.py
-```
-
-The backend should start on:
-
-```text
-http://127.0.0.1:5000
-```
-
-## 19. Testing the API
-
-Test the home route:
-
-```bash
-curl http://127.0.0.1:5000/
-```
-
-Test prediction with an image:
-
-```bash
-curl -X POST http://127.0.0.1:5000/predict -F "image=@test.jpg"
-```
-
-Test all remedies:
+Example:
 
 ```bash
 curl http://127.0.0.1:5000/api/remedies
 ```
 
-Test remedies by herb name:
+Response shape:
 
-```bash
-curl http://127.0.0.1:5000/api/remedies/by/Lidah%20Buaya
+```json
+[
+  {
+    "herb_name": "Lidah Buaya",
+    "instructions": "Apply gel to affected area.",
+    "used_for": "Skin irritation",
+    "dosage": "As needed",
+    "side_effects": "Possible irritation",
+    "contraindications": "Avoid if allergic",
+    "warnings": "External use only",
+    "interactions": null,
+    "part_used": "Leaf gel"
+  }
+]
 ```
 
-Test explore pagination:
+### 6.4 `GET /api/remedies/by/<herb_name>`
+
+Returns remedies for a specific herb name.
+
+Example:
+
+```bash
+curl "http://127.0.0.1:5000/api/remedies/by/Lidah%20Buaya"
+```
+
+Flow:
+
+1. Search `herbs` where `herb_name` equals the provided path value.
+2. If no matching herb exists, return `[]`.
+3. Collect matching `herb_id` values.
+4. Query `herbal_recipes` where `herb_id` is in that list.
+5. Return flattened remedy objects.
+
+Response:
+
+```json
+[
+  {
+    "herb_name": "Lidah Buaya",
+    "instructions": "Apply gel to affected area.",
+    "used_for": "Skin irritation",
+    "dosage": "As needed",
+    "side_effects": "Possible irritation",
+    "contraindications": "Avoid if allergic",
+    "warnings": "External use only",
+    "interactions": null,
+    "part_used": "Leaf gel"
+  }
+]
+```
+
+### 6.5 `GET /api/explore`
+
+Returns paginated explore-page data.
+
+Query parameters:
+
+| Parameter | Default | Description |
+|---|---:|---|
+| `page` | `1` | Page number. |
+| `per_page` | `6` | Number of records per page. |
+
+Example:
 
 ```bash
 curl "http://127.0.0.1:5000/api/explore?page=1&per_page=6"
 ```
 
-## 20. Summary
+Response shape:
 
-This backend acts as the main processing layer for the Sprout herbal plant identification system. It receives images from the frontend, uses a trained PyTorch model for classification, enriches the result with Trefle plant data, and provides Supabase recipe endpoints for herbal use information. The code is separated into clear modules: `app.py` for application setup, `routes/predict.py` for image prediction, `routes/explore.py` for remedy and explore data, `core/inference.py` for model loading and prediction, and `core/model.py` for the neural network architecture.
+```json
+{
+  "herbs": [
+    {
+      "id": 1,
+      "recipe_id": 1,
+      "herb_id": 2,
+      "herb_name": "Lidah Buaya",
+      "scientific_name": "Aloe vera",
+      "common_name": "Aloe",
+      "image_url": "https://example.com/image.jpg",
+      "remedies": [
+        {
+          "recipe_id": 1,
+          "used_for": "Skin irritation",
+          "part_used": "Leaf gel",
+          "dosage": "As needed",
+          "instructions": "Apply gel to affected area.",
+          "side_effects": "Possible irritation",
+          "contraindications": "Avoid if allergic",
+          "warnings": "External use only",
+          "interactions": null
+        }
+      ]
+    }
+  ],
+  "total_pages": 10,
+  "total": 60,
+  "page": 1
+}
+```
+
+## 7. Complete Prediction Flow
+
+```text
+Frontend user selects or captures an image
+-> Frontend sends POST /predict with multipart form field "image"
+-> Flask validates the request
+-> Flask saves the image temporarily in Backend-Test/uploads/
+-> core.inference opens the image with PIL
+-> torchvision transforms resize and normalize the image
+-> PyTorch model predicts class logits
+-> softmax converts logits to probabilities
+-> top 3 predictions are selected
+-> confidence threshold decides known plant vs Unknown
+-> route extracts scientific/English name and Indonesian name
+-> backend asks Trefle for plant metadata
+-> backend returns JSON result to the frontend
+-> temporary upload is deleted
+-> frontend can call /api/remedies/by/<indonesian_name>
+-> backend retrieves related remedy data from Supabase
+```
+
+## 8. Explore and Remedy Data Flow
+
+```text
+Frontend opens Explore page
+-> Frontend calls GET /api/explore?page=1&per_page=6
+-> Flask calculates Supabase range
+-> Supabase returns herbal_recipes joined with herbs
+-> backend asks Trefle for image/common-name metadata per item
+-> backend formats each record as a frontend card
+-> frontend renders plant/remedy cards
+```
+
+For a prediction result:
+
+```text
+Model predicts "Aloe Vera (Lidah Buaya)"
+-> predict route adds "indonesian_name": "Lidah Buaya"
+-> frontend calls /api/remedies/by/Lidah%20Buaya
+-> backend finds herbs.herb_name == "Lidah Buaya"
+-> backend uses herb_id to fetch herbal_recipes
+-> frontend displays remedy information
+```
+
+## 9. Model Behavior
+
+The model is a 113-class plant classifier. It produces probabilities for all known classes and returns the top three.
+
+The backend uses a fixed confidence threshold:
+
+```text
+top confidence < 0.7 -> final = Unknown
+top confidence >= 0.7 -> final = top predicted class
+```
+
+This threshold is a product decision. A higher threshold means fewer false positives but more `Unknown` results. A lower threshold means more confident-looking predictions but a higher risk of incorrect plant labels.
+
+## 10. Local Development Setup
+
+### 10.1 Create and Activate a Virtual Environment
+
+From the repo root:
+
+```bash
+cd Backend-Test
+python -m venv venv
+```
+
+Windows PowerShell:
+
+```powershell
+.\venv\Scripts\Activate.ps1
+```
+
+macOS/Linux:
+
+```bash
+source venv/bin/activate
+```
+
+### 10.2 Install Dependencies
+
+From inside `Backend-Test`:
+
+```bash
+pip install -r requirements.txt
+```
+
+Or from the repo root:
+
+```bash
+pip install -r requirements.txt
+```
+
+The root `requirements.txt` points to the nested requirements file.
+
+### 10.3 Configure Environment Variables
+
+Create `Backend-Test/.env`:
+
+```text
+TREFLE_TOKEN=your_trefle_token
+TREFLE_API_URL=https://trefle.io/api/v1/plants/search
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your_supabase_key
+```
+
+### 10.4 Run the App
+
+From inside `Backend-Test`:
+
+```bash
+python app.py
+```
+
+The development server should run at:
+
+```text
+http://127.0.0.1:5000
+```
+
+### 10.5 Test Basic Routes
+
+Health check:
+
+```bash
+curl http://127.0.0.1:5000/
+```
+
+Prediction:
+
+```bash
+curl -X POST http://127.0.0.1:5000/predict -F "image=@test.jpg"
+```
+
+Explore:
+
+```bash
+curl "http://127.0.0.1:5000/api/explore?page=1&per_page=6"
+```
+
+Remedy lookup:
+
+```bash
+curl "http://127.0.0.1:5000/api/remedies/by/Lidah%20Buaya"
+```
+
+## 11. Railway Deployment
+
+Railway initially failed because Railpack analyzed the repository root and did not see a root-level Python app or root-level `requirements.txt`. The live Flask app is nested inside `Backend-Test`, so deployment needs explicit root files.
+
+The project now includes:
+
+| File | Purpose |
+|---|---|
+| `requirements.txt` | Makes Railway detect Python dependencies from the root. |
+| `start.sh` | Starts Gunicorn from inside `Backend-Test`. |
+| `railway.json` | Sets Railway's start command to `bash start.sh`. |
+
+Railway start command:
+
+```bash
+bash start.sh
+```
+
+Gunicorn command:
+
+```bash
+gunicorn app:app --bind "0.0.0.0:${PORT:-5000}"
+```
+
+Railway environment variables required:
+
+```text
+TREFLE_TOKEN
+TREFLE_API_URL
+SUPABASE_URL
+SUPABASE_KEY
+```
+
+Deployment note: the model weights are not committed to Git. On startup, the backend checks for `weights/internimage.pth` and downloads it through `gdown` if needed. This can make first startup slower and can fail if Google Drive blocks, rate-limits, or changes access to the file.
+
+## 12. Git and Repository Configuration
+
+### 12.1 `.gitignore`
+
+Ignored files:
+
+```text
+.env
+*.pyc
+__pycache__/
+uploads/
+.venv/
+venv/
+.DS_Store
+weights/
+.pth
+```
+
+Important effects:
+
+1. API keys are not committed.
+2. Uploaded images are not committed.
+3. Virtual environments are not committed.
+4. Model weights are not committed.
+
+### 12.2 `.gitattributes`
+
+The repository contains Git LFS rules for `.pth` files:
+
+```text
+*.pth filter=lfs diff=lfs merge=lfs -text
+Backend-Test/weights/internimage.pth filter=lfs diff=lfs merge=lfs -text
+```
+
+However, the current `.gitignore` excludes `.pth` and `weights/`, so model weights are not currently pushed. The app downloads weights at runtime instead.
+
+## 13. Security and Privacy Notes
+
+### 13.1 API Keys
+
+Never commit `.env`. Supabase and Trefle credentials should be set through environment variables locally and through Railway environment variables in production.
+
+### 13.2 Uploaded Images
+
+Uploaded images are saved only temporarily. The prediction route deletes them after the response is generated. This helps reduce storage usage and avoids keeping user images unnecessarily.
+
+### 13.3 Filename Safety
+
+The upload route uses `secure_filename()` to sanitize user-provided filenames before writing them to disk.
+
+### 13.4 Medical Disclaimer
+
+The backend returns herbal remedy information from Supabase. This information should be treated as educational content, not medical advice. Any frontend using this backend should communicate that users should consult qualified professionals before using herbal remedies, especially if pregnant, taking medication, allergic, or managing medical conditions.
+
+## 14. Known Limitations
+
+| Limitation | Details |
+|---|---|
+| No authentication | Any client that can reach the backend can call the endpoints. |
+| No rate limiting | Heavy traffic can overload model inference or external APIs. |
+| Runtime model download | Cold starts depend on Google Drive availability. |
+| Trefle dependency | Plant images/common names may be missing if Trefle fails. |
+| Supabase dependency | Remedy endpoints require valid Supabase credentials and table structure. |
+| No persistent prediction history | Uploaded images and prediction results are not stored by this backend. |
+| Confidence threshold is fixed | The `0.7` threshold is hardcoded. |
+| Class-label format dependency | Name extraction expects labels like `Name (Indonesian Name)`. |
+
+## 15. Common Troubleshooting
+
+### Railway says Railpack cannot determine how to build the app
+
+Cause: Railway analyzed the root and did not find Python build markers.
+
+Fix: keep these root files:
+
+```text
+requirements.txt
+start.sh
+railway.json
+```
+
+### App crashes because `class_names.json` is missing
+
+Cause: app was started from the wrong working directory.
+
+Fix: start from `Backend-Test`, or use `start.sh`.
+
+### App crashes because `weights/internimage.pth` is missing
+
+Cause: the weights file is ignored by Git and needs to be downloaded at startup.
+
+Fix:
+
+1. Confirm the Google Drive model URL is accessible.
+2. Confirm `gdown` is installed.
+3. Confirm Railway has enough disk space and startup time.
+
+### Supabase routes return errors
+
+Possible causes:
+
+1. `SUPABASE_URL` missing.
+2. `SUPABASE_KEY` missing.
+3. Tables are named differently.
+4. Columns are missing.
+5. Row Level Security blocks the query.
+
+### Trefle enrichment is missing
+
+Possible causes:
+
+1. `TREFLE_TOKEN` missing.
+2. `TREFLE_API_URL` missing.
+3. Trefle returned no matching plant.
+4. Trefle request timed out or failed.
+
+The prediction can still return model results even when Trefle enrichment is unavailable.
+
+## 16. Recommended Future Improvements
+
+| Improvement | Benefit |
+|---|---|
+| Move model weights to a more stable storage provider | More reliable deployment startup than Google Drive. |
+| Add file type validation | Prevent non-image uploads from reaching PIL/model inference. |
+| Add request size limits | Protect server memory and disk usage. |
+| Add rate limiting | Protect model inference and Trefle/Supabase quotas. |
+| Add structured logging | Easier debugging in Railway logs. |
+| Add health endpoint that checks dependencies | Separate simple app health from model/Supabase/Trefle readiness. |
+| Add tests | Catch route and response-shape regressions. |
+| Cache Trefle results | Reduce repeated external API calls on explore pages. |
+| Add async/background model download | Improve startup visibility and failure handling. |
+| Consider renaming `Backend-Test` | A production directory name like `backend` would be clearer. |
+| Consider renaming `InternImageClassifier` | The implementation uses ConvNeXt Tiny, so the current class name may confuse readers. |
+
+## 17. Existing Supporting Guides
+
+The repository also includes:
+
+| File | Notes |
+|---|---|
+| `Backend-Test/FLASK_BACKEND_GUIDE.md` | Older/general Flask guide. Some parts describe prediction history endpoints that are not in the current live code. |
+| `Backend-Test/supabase-flask-guide.md` | General Supabase/PostgreSQL guide. The current project uses the Supabase Python client, not raw `psycopg2`. |
+
+Use this `PROJECT_DOCUMENTATION.md` file as the authoritative documentation for the current implementation.
+
+## 18. Summary
+
+Sprout Backend is a Flask API that supports an herbal plant identification app. It receives plant images, classifies them with a PyTorch model, enriches results with Trefle plant metadata, and serves Supabase-backed remedy data for frontend pages.
+
+The core application lives in `Backend-Test`. The root-level files exist mostly to support deployment and repository documentation. The most important runtime dependencies are the model weights, class-name mapping, Supabase credentials, and Trefle credentials.
+
+The current backend is functional and deployable, but it should be treated as an application backend with external dependencies. Production hardening should focus on reliable model storage, request validation, rate limiting, logging, and tests.
